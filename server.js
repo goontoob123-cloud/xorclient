@@ -1,71 +1,100 @@
 const express = require('express');
-const WebSocket = require('ws');
 const path = require('path');
 const cors = require('cors');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Enable CORS
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Store connected clients
-const clients = new Set();
+// Store active players
+const activePlayers = new Map(); // username -> { roomCode, lastSeen, playerCount, maxPlayers }
 
-// Create WebSocket server
-const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8080 });
+// Cleanup inactive players every minute
+setInterval(() => {
+    const now = Date.now();
+    for (const [username, data] of activePlayers.entries()) {
+        if (now - data.lastSeen > 60000) { // 60 seconds timeout
+            activePlayers.delete(username);
+        }
+    }
+}, 60000);
 
-wss.on('connection', (ws) => {
-    console.log('New client connected');
-    clients.add(ws);
+// Heartbeat endpoint - players send their status every 30 seconds
+app.post('/api/heartbeat', (req, res) => {
+    const { username, roomCode, playerCount, maxPlayers, timestamp } = req.body;
     
-    ws.on('message', (message) => {
-        console.log('Received:', message.toString());
-        // Broadcast to all other clients if needed
-        clients.forEach(client => {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-                client.send(message.toString());
-            }
-        });
-    });
-    
-    ws.on('close', () => {
-        console.log('Client disconnected');
-        clients.delete(ws);
-    });
-    
-    ws.send(JSON.stringify({ title: 'Connected', message: 'WebSocket connection established!', id: 'connection' }));
-});
-
-// API endpoint to send notifications
-app.post('/api/send-notification', (req, res) => {
-    const { title, message } = req.body;
-    
-    if (!title || !message) {
-        return res.status(400).json({ error: 'Title and message are required' });
+    if (!username) {
+        return res.status(400).json({ error: 'Username required' });
     }
     
-    const notification = {
-        title: title.toUpperCase(),
-        message: message,
-        id: Date.now().toString()
-    };
-    
-    // Send to all connected clients
-    let sentCount = 0;
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(notification));
-            sentCount++;
-        }
+    activePlayers.set(username, {
+        roomCode: roomCode || 'Not in room',
+        playerCount: playerCount || 0,
+        maxPlayers: maxPlayers || 0,
+        lastSeen: Date.now(),
+        lastSeenTime: timestamp
     });
+    
+    // Log to console (server logs)
+    console.log(`[HEARTBEAT] ${username} - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
     
     res.json({ 
         success: true, 
-        message: `Notification sent to ${sentCount} client(s)`,
-        notification: notification
+        onlineCount: activePlayers.size,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Search endpoint
+app.get('/api/search', (req, res) => {
+    const searchUsername = req.query.username;
+    
+    if (!searchUsername) {
+        return res.status(400).json({ error: 'Username parameter required' });
+    }
+    
+    const results = [];
+    
+    // Search for matching usernames (case-insensitive partial match)
+    for (const [username, data] of activePlayers.entries()) {
+        if (username.toLowerCase().includes(searchUsername.toLowerCase())) {
+            results.push({
+                username: username,
+                roomCode: data.roomCode,
+                lastSeen: data.lastSeenTime
+            });
+        }
+    }
+    
+    console.log(`[SEARCH] Query: "${searchUsername}" - Found ${results.length} results`);
+    
+    res.json(results);
+});
+
+// Get online count endpoint (for the mod to display)
+app.get('/api/onlinecount', (req, res) => {
+    res.json({ onlineCount: activePlayers.size });
+});
+
+// Simple status endpoint (no HTML, just JSON)
+app.get('/api/status', (req, res) => {
+    const players = [];
+    for (const [username, data] of activePlayers.entries()) {
+        players.push({
+            username: username,
+            roomCode: data.roomCode,
+            playerCount: data.playerCount,
+            maxPlayers: data.maxPlayers
+        });
+    }
+    
+    res.json({
+        onlineCount: activePlayers.size,
+        players: players,
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -75,6 +104,11 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => {
-    console.log(`HTTP server running on port ${port}`);
-    console.log(`WebSocket server running on port ${process.env.WS_PORT || 8080}`);
+    console.log(`API server running on port ${port}`);
+    console.log(`Tracked players will appear in console logs`);
+    console.log(`API endpoints:`);
+    console.log(`  POST /api/heartbeat - Player heartbeat`);
+    console.log(`  GET  /api/search?username= - Search players`);
+    console.log(`  GET  /api/onlinecount - Get online count`);
+    console.log(`  GET  /api/status - Get all players (JSON only)`);
 });
