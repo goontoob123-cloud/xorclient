@@ -50,20 +50,30 @@ function scheduleSave() {
 }
 
 async function savePlayersToGitHub() {
-    if (!GH_TOKEN || !GH_OWNER || !GH_REPO) return;
+    if (!GH_TOKEN) { console.error('[CACHE] GH_TOKEN not set — cannot save to GitHub'); return; }
     try {
         const content = Buffer.from(JSON.stringify(playerCache, null, 2)).toString('base64');
-        const body = JSON.stringify({
-            message: 'chore: update players cache',
-            content,
-            sha: ghFileSha || undefined
-        });
+        const bodyObj = { message: 'chore: update players cache', content };
+        if (ghFileSha) bodyObj.sha = ghFileSha;
+        const body = JSON.stringify(bodyObj);
+        console.log(`[CACHE] Saving to GitHub (sha: ${ghFileSha || 'none'}, players: ${Object.keys(playerCache).length})`);
         const result = await ghPut(`/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`, body);
         const parsed = JSON.parse(result);
-        if (parsed.content && parsed.content.sha) ghFileSha = parsed.content.sha;
-        console.log(`[CACHE] Saved ${Object.keys(playerCache).length} players to GitHub`);
+        if (parsed.content && parsed.content.sha) {
+            ghFileSha = parsed.content.sha;
+            console.log(`[CACHE] Saved OK — new sha: ${ghFileSha}`);
+        }
     } catch (e) {
         console.error('[CACHE] Failed to save to GitHub:', e.message);
+        // If we get a 409 conflict (sha mismatch), re-fetch the sha and retry once
+        if (e.message.includes('409')) {
+            console.log('[CACHE] SHA conflict — re-fetching sha and retrying...');
+            try {
+                const data = await ghGet(`/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`);
+                ghFileSha = JSON.parse(data).sha;
+                await savePlayersToGitHub();
+            } catch (e2) { console.error('[CACHE] Retry failed:', e2.message); }
+        }
     }
 }
 
@@ -105,6 +115,7 @@ function ghPut(apiPath, body) {
 }
 
 // Load on startup
+console.log(`[CACHE] GH_TOKEN set: ${!!GH_TOKEN}, repo: ${GH_OWNER}/${GH_REPO}, path: ${GH_PATH}`);
 loadPlayersFromGitHub();
 
 // Store active players
