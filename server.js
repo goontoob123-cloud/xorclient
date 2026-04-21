@@ -1,7 +1,6 @@
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
-const fs   = require('fs');
 const https = require('https');
 
 const app = express();
@@ -11,112 +10,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// ── GitHub persistence config ─────────────────────────────────────────────────
-// Set these as environment variables on Render, never hardcode tokens
-const GH_TOKEN  = process.env.GH_TOKEN;
-const GH_OWNER  = process.env.GH_OWNER || 'goontoob123-cloud';
-const GH_REPO   = process.env.GH_REPO  || 'xorclient';
-const GH_PATH   = 'players.json';
-
-let playerCache = {};
-let ghFileSha   = null; // needed for GitHub API updates
-
-// Load players.json from GitHub on startup
-async function loadPlayersFromGitHub() {
-    if (!GH_TOKEN || !GH_OWNER || !GH_REPO) {
-        console.log('[CACHE] GitHub env vars not set, using in-memory only');
-        return;
-    }
-    try {
-        const data = await ghGet(`/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`);
-        const parsed = JSON.parse(data);
-        ghFileSha   = parsed.sha;
-        playerCache = JSON.parse(Buffer.from(parsed.content, 'base64').toString('utf8'));
-        console.log(`[CACHE] Loaded ${Object.keys(playerCache).length} players from GitHub`);
-    } catch (e) {
-        console.log('[CACHE] Could not load players.json from GitHub:', e.message);
-    }
-}
-
-// Save players.json to GitHub
-let saveQueued = false;
-function scheduleSave() {
-    if (saveQueued) return;
-    saveQueued = true;
-    setTimeout(async () => {
-        saveQueued = false;
-        await savePlayersToGitHub();
-    }, 5000); // debounce — save at most once every 5s
-}
-
-async function savePlayersToGitHub() {
-    if (!GH_TOKEN) { console.error('[CACHE] GH_TOKEN not set — cannot save to GitHub'); return; }
-    try {
-        const content = Buffer.from(JSON.stringify(playerCache, null, 2)).toString('base64');
-        const bodyObj = { message: 'chore: update players cache', content };
-        if (ghFileSha) bodyObj.sha = ghFileSha;
-        const body = JSON.stringify(bodyObj);
-        console.log(`[CACHE] Saving to GitHub (sha: ${ghFileSha || 'none'}, players: ${Object.keys(playerCache).length})`);
-        const result = await ghPut(`/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`, body);
-        const parsed = JSON.parse(result);
-        if (parsed.content && parsed.content.sha) {
-            ghFileSha = parsed.content.sha;
-            console.log(`[CACHE] Saved OK — new sha: ${ghFileSha}`);
-        }
-    } catch (e) {
-        console.error('[CACHE] Failed to save to GitHub:', e.message);
-        // If we get a 409 conflict (sha mismatch), re-fetch the sha and retry once
-        if (e.message.includes('409')) {
-            console.log('[CACHE] SHA conflict — re-fetching sha and retrying...');
-            try {
-                const data = await ghGet(`/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_PATH}`);
-                ghFileSha = JSON.parse(data).sha;
-                await savePlayersToGitHub();
-            } catch (e2) { console.error('[CACHE] Retry failed:', e2.message); }
-        }
-    }
-}
-
-function ghGet(apiPath) {
-    return new Promise((resolve, reject) => {
-        const options = {
-            hostname: 'api.github.com',
-            path: apiPath,
-            method: 'GET',
-            headers: { 'Authorization': `token ${GH_TOKEN}`, 'User-Agent': 'xorv-server', 'Accept': 'application/vnd.github.v3+json' }
-        };
-        const req = https.request(options, res => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => res.statusCode >= 400 ? reject(new Error(`HTTP ${res.statusCode}: ${data}`)) : resolve(data));
-        });
-        req.on('error', reject);
-        req.end();
-    });
-}
-
-function ghPut(apiPath, body) {
-    return new Promise((resolve, reject) => {
-        const options = {
-            hostname: 'api.github.com',
-            path: apiPath,
-            method: 'PUT',
-            headers: { 'Authorization': `token ${GH_TOKEN}`, 'User-Agent': 'xorv-server', 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-        };
-        const req = https.request(options, res => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => res.statusCode >= 400 ? reject(new Error(`HTTP ${res.statusCode}: ${data}`)) : resolve(data));
-        });
-        req.on('error', reject);
-        req.write(body);
-        req.end();
-    });
-}
-
-// Load on startup
-console.log(`[CACHE] GH_TOKEN set: ${!!GH_TOKEN}, repo: ${GH_OWNER}/${GH_REPO}, path: ${GH_PATH}`);
-loadPlayersFromGitHub();
+// In-memory player cache — persists until server restarts
+// playFabId (or 'user:username') -> { username, playFabId, firstSeen, lastSeen }
+const playerCache = {};
 
 // Store active players
 const activePlayers = new Map(); // username -> { roomCode, lastSeen, playerCount, maxPlayers, playFabId }
@@ -157,9 +53,7 @@ app.post('/api/heartbeat', (req, res) => {
     const now = new Date().toISOString();
     if (!existing) {
         playerCache[cacheKey] = { username, playFabId: playFabId || '', firstSeen: now, lastSeen: now };
-        scheduleSave();
     } else {
-        const changed = existing.username !== username || existing.playFabId !== (playFabId || '');
         existing.username  = username;
         existing.playFabId = playFabId || '';
         existing.lastSeen  = now;
@@ -167,7 +61,6 @@ app.post('/api/heartbeat', (req, res) => {
             playerCache[playFabId] = existing;
             delete playerCache[cacheKey];
         }
-        scheduleSave();
     }
     
     console.log(`[HEARTBEAT] ${username} (${playFabId || 'no id'}) - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
