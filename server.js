@@ -10,7 +10,10 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // Store active players
-const activePlayers = new Map(); // username -> { roomCode, lastSeen, playerCount, maxPlayers }
+const activePlayers = new Map(); // username -> { roomCode, lastSeen, playerCount, maxPlayers, playFabId }
+
+// Blacklist — username -> { reason, blacklistedAt }
+const blacklist = new Map();
 
 // Cleanup inactive players every minute
 setInterval(() => {
@@ -24,7 +27,7 @@ setInterval(() => {
 
 // Heartbeat endpoint - players send their status every 30 seconds
 app.post('/api/heartbeat', (req, res) => {
-    const { username, roomCode, playerCount, maxPlayers, timestamp } = req.body;
+    const { username, roomCode, playerCount, maxPlayers, timestamp, playFabId } = req.body;
     
     if (!username) {
         return res.status(400).json({ error: 'Username required' });
@@ -35,11 +38,11 @@ app.post('/api/heartbeat', (req, res) => {
         playerCount: playerCount || 0,
         maxPlayers: maxPlayers || 0,
         lastSeen: Date.now(),
-        lastSeenTime: timestamp
+        lastSeenTime: timestamp,
+        playFabId: playFabId || ''
     });
     
-    // Log to console (server logs)
-    console.log(`[HEARTBEAT] ${username} - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
+    console.log(`[HEARTBEAT] ${username} (${playFabId || 'no id'}) - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
     
     res.json({ 
         success: true, 
@@ -85,6 +88,7 @@ app.get('/api/status', (req, res) => {
     for (const [username, data] of activePlayers.entries()) {
         players.push({
             username: username,
+            playFabId: data.playFabId || '',
             roomCode: data.roomCode,
             playerCount: data.playerCount,
             maxPlayers: data.maxPlayers
@@ -111,6 +115,33 @@ app.get('/api/verify', (req, res) => {
     res.json({ owner: id === OWNER_ID });
 });
 
+// Blacklist check — mod calls this on startup
+app.get('/api/blacklist/check', (req, res) => {
+    const username = req.query.username;
+    if (!username) return res.status(400).json({ blacklisted: false });
+    const entry = blacklist.get(username.toLowerCase());
+    if (entry) return res.json({ blacklisted: true, reason: entry.reason });
+    res.json({ blacklisted: false });
+});
+
+// Blacklist a player — GET /api/blacklist?username=NAME&reason=REASON
+app.get('/api/blacklist', (req, res) => {
+    const { username, reason } = req.query;
+    if (!username) return res.status(400).json({ error: 'Username required' });
+    blacklist.set(username.toLowerCase(), { reason: reason || 'No reason given', blacklistedAt: new Date().toISOString() });
+    console.log(`[BLACKLIST] Added: ${username} — Reason: ${reason || 'No reason given'}`);
+    res.json({ success: true, username, reason: reason || 'No reason given' });
+});
+
+// Unblacklist a player — GET /api/unblacklist?username=NAME
+app.get('/api/unblacklist', (req, res) => {
+    const { username } = req.query;
+    if (!username) return res.status(400).json({ error: 'Username required' });
+    const existed = blacklist.delete(username.toLowerCase());
+    console.log(`[BLACKLIST] Removed: ${username} (was blacklisted: ${existed})`);
+    res.json({ success: true, username, wasBlacklisted: existed });
+});
+
 app.listen(port, () => {
     console.log(`API server running on port ${port}`);
     console.log(`Tracked players will appear in console logs`);
@@ -120,4 +151,7 @@ app.listen(port, () => {
     console.log(`  GET  /api/onlinecount - Get online count`);
     console.log(`  GET  /api/status - Get all players (JSON only)`);
     console.log(`  GET  /api/verify?id= - Owner verification`);
+    console.log(`  GET  /api/blacklist/check?username= - Check if blacklisted`);
+    console.log(`  GET  /api/blacklist?username=&reason= - Blacklist player`);
+    console.log(`  GET  /api/unblacklist?username= - Unblacklist player`);
 });
