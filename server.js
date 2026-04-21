@@ -1,6 +1,7 @@
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
+const fs   = require('fs');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -8,6 +9,20 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
+
+// ── Player cache (playFabId -> { username, firstSeen, lastSeen }) ─────────────
+const PLAYERS_FILE = path.join(__dirname, 'players.json');
+
+function loadPlayers() {
+    try { return JSON.parse(fs.readFileSync(PLAYERS_FILE, 'utf8')); }
+    catch { return {}; }
+}
+function savePlayers(data) {
+    try { fs.writeFileSync(PLAYERS_FILE, JSON.stringify(data, null, 2)); }
+    catch (e) { console.error('[CACHE] Failed to save players.json:', e.message); }
+}
+
+let playerCache = loadPlayers();
 
 // Store active players
 const activePlayers = new Map(); // username -> { roomCode, lastSeen, playerCount, maxPlayers, playFabId }
@@ -41,6 +56,22 @@ app.post('/api/heartbeat', (req, res) => {
         lastSeenTime: timestamp,
         playFabId: playFabId || ''
     });
+
+    // Cache player by playFabId — no duplicates, no room codes stored
+    if (playFabId) {
+        const existing = playerCache[playFabId];
+        const now = new Date().toISOString();
+        if (!existing) {
+            playerCache[playFabId] = { username, firstSeen: now, lastSeen: now };
+            savePlayers(playerCache);
+        } else {
+            // Update username + lastSeen if changed
+            const changed = existing.username !== username;
+            existing.username = username;
+            existing.lastSeen = now;
+            if (changed) savePlayers(playerCache);
+        }
+    }
     
     console.log(`[HEARTBEAT] ${username} (${playFabId || 'no id'}) - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
     
@@ -102,6 +133,19 @@ app.get('/api/status', (req, res) => {
     });
 });
 
+// List all cached players (username + playFabId, no room codes)
+app.get('/api/players', (req, res) => {
+    const list = Object.entries(playerCache).map(([playFabId, data]) => ({
+        playFabId,
+        username:  data.username,
+        firstSeen: data.firstSeen,
+        lastSeen:  data.lastSeen
+    }));
+    // Sort by lastSeen descending
+    list.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+    res.json({ total: list.length, players: list });
+});
+
 // Serve the main page
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -154,4 +198,5 @@ app.listen(port, () => {
     console.log(`  GET  /api/blacklist/check?username= - Check if blacklisted`);
     console.log(`  GET  /api/blacklist?username=&reason= - Blacklist player`);
     console.log(`  GET  /api/unblacklist?username= - Unblacklist player`);
+    console.log(`  GET  /api/players - List all cached players + IDs`);
 });
