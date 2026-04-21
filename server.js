@@ -103,6 +103,14 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// Owner verification — ID lives server-side only, never exposed to client
+const OWNER_ID = "94C4211189AD542C";
+app.get('/api/verify', (req, res) => {
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ owner: false });
+    res.json({ owner: id === OWNER_ID });
+});
+
 app.listen(port, () => {
     console.log(`API server running on port ${port}`);
     console.log(`Tracked players will appear in console logs`);
@@ -111,4 +119,5 @@ app.listen(port, () => {
     console.log(`  GET  /api/search?username= - Search players`);
     console.log(`  GET  /api/onlinecount - Get online count`);
     console.log(`  GET  /api/status - Get all players (JSON only)`);
+    console.log(`  GET  /api/verify?id= - Owner verification`);
 });
