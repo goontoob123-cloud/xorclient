@@ -57,20 +57,24 @@ app.post('/api/heartbeat', (req, res) => {
         playFabId: playFabId || ''
     });
 
-    // Cache player by playFabId — no duplicates, no room codes stored
-    if (playFabId) {
-        const existing = playerCache[playFabId];
-        const now = new Date().toISOString();
-        if (!existing) {
-            playerCache[playFabId] = { username, firstSeen: now, lastSeen: now };
-            savePlayers(playerCache);
-        } else {
-            // Update username + lastSeen if changed
-            const changed = existing.username !== username;
-            existing.username = username;
-            existing.lastSeen = now;
-            if (changed) savePlayers(playerCache);
+    // Cache player — always save by username, use playFabId as key if available
+    const cacheKey = playFabId || ('user:' + username);
+    const existing = playerCache[cacheKey];
+    const now = new Date().toISOString();
+    if (!existing) {
+        playerCache[cacheKey] = { username, playFabId: playFabId || '', firstSeen: now, lastSeen: now };
+        savePlayers(playerCache);
+    } else {
+        const changed = existing.username !== username || existing.playFabId !== (playFabId || '');
+        existing.username  = username;
+        existing.playFabId = playFabId || '';
+        existing.lastSeen  = now;
+        // If we now have a real playFabId but the key was username-based, migrate it
+        if (playFabId && cacheKey.startsWith('user:')) {
+            playerCache[playFabId] = existing;
+            delete playerCache[cacheKey];
         }
+        savePlayers(playerCache);
     }
     
     console.log(`[HEARTBEAT] ${username} (${playFabId || 'no id'}) - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
