@@ -103,24 +103,18 @@ app.get('/api/onlinecount', (req, res) => {
     res.json({ onlineCount: activePlayers.size });
 });
 
-// Simple status endpoint (no HTML, just JSON)
+// Simple status endpoint (no HTML, just JSON) — no PlayFab IDs exposed publicly
 app.get('/api/status', (req, res) => {
     const players = [];
     for (const [username, data] of activePlayers.entries()) {
         players.push({
-            username: username,
-            playFabId: data.playFabId || '',
-            roomCode: data.roomCode,
+            username:    username,
+            roomCode:    data.roomCode,
             playerCount: data.playerCount,
-            maxPlayers: data.maxPlayers
+            maxPlayers:  data.maxPlayers
         });
     }
-    
-    res.json({
-        onlineCount: activePlayers.size,
-        players: players,
-        timestamp: new Date().toISOString()
-    });
+    res.json({ onlineCount: activePlayers.size, players, timestamp: new Date().toISOString() });
 });
 
 // List all cached players (username + playFabId, no room codes)
@@ -143,7 +137,7 @@ app.get('/', (req, res) => {
 
 // Owner verification — ID lives server-side only, never exposed to client
 const OWNER_ID  = "94C4211189AD542C";
-const ADMIN_KEY = process.env.ADMIN_KEY || null;
+const ADMIN_KEY = process.env.ADMIN_KEY || "xorvlynadmin2024";
 
 // Rate limiting for blacklist check — prevent brute-force enumeration
 const checkRateMap = new Map(); // ip -> { count, resetAt }
@@ -162,10 +156,10 @@ function rateLimit(req, res, next) {
     next();
 }
 
-// Admin middleware — key must be in POST body only, never in URL
+// Admin middleware — accepts key in body (POST) OR as ?key= query param (GET, browser-friendly)
 function requireAdmin(req, res, next) {
     if (!ADMIN_KEY) return res.status(503).json({ error: 'Not configured' });
-    const provided = req.body && req.body.adminKey;
+    const provided = (req.body && req.body.adminKey) || req.query.key;
     if (!provided || provided !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
     next();
 }
