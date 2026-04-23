@@ -117,18 +117,7 @@ app.get('/api/status', (req, res) => {
     res.json({ onlineCount: activePlayers.size, players, timestamp: new Date().toISOString() });
 });
 
-// List all cached players (username + playFabId, no room codes)
-app.get('/api/players', (req, res) => {
-    const list = Object.entries(playerCache).map(([playFabId, data]) => ({
-        playFabId,
-        username:  data.username,
-        firstSeen: data.firstSeen,
-        lastSeen:  data.lastSeen
-    }));
-    // Sort by lastSeen descending
-    list.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
-    res.json({ total: list.length, players: list });
-});
+// /api/players is admin-only — see POST /api/admin/players
 
 // Serve the main page
 app.get('/', (req, res) => {
