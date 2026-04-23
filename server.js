@@ -16,8 +16,8 @@ const OWNER_ID    = "94C4211189AD542C";
 const ADMIN_KEY   = process.env.ADMIN_KEY   || "xorvlynadmin2024";
 const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || "";
 
-// ── Stores ────────────────────────────────────────────────────────────
-const activePlayers = new Map();
+// Notification queue: username -> [{ title, message }]
+const notifyQueue = new Map();
 const playerCache   = {};
 const blacklist     = new Map();
 // key -> { owner, hwid, tier, createdAt, expiresAt, lastUsed, useCount, banned, banReason, lastUsername }
@@ -204,7 +204,37 @@ app.post('/api/heartbeat', (req, res) => {
     const ex = playerCache[ck]; const now = new Date().toISOString();
     if (!ex) { playerCache[ck] = { username, playFabId: playFabId||'', firstSeen: now, lastSeen: now }; }
     else { ex.username = username; ex.playFabId = playFabId||''; ex.lastSeen = now; if (playFabId && ck.startsWith('user:')) { playerCache[playFabId] = ex; delete playerCache[ck]; } }
-    res.json({ success: true, onlineCount: activePlayers.size, timestamp: new Date().toISOString() });
+    // Drain any queued notifications for this user
+    const pending = notifyQueue.get(username) || [];
+    notifyQueue.delete(username);
+
+    res.json({ success: true, onlineCount: activePlayers.size, timestamp: new Date().toISOString(), notifications: pending });
+});
+
+// GET /api/admin/notify?key=ADMIN&username=NAME&title=TITLE&message=MSG
+// Push a real-time notification to a specific player (delivered on next heartbeat)
+// Use username=* to broadcast to everyone currently online
+app.get('/api/admin/notify', requireAdmin, (req, res) => {
+    const { username, title, message } = req.query;
+    if (!username || !title) return res.status(400).json({ error: 'username and title required' });
+    const notif = { title, message: message || '' };
+    if (username === '*') {
+        // Broadcast to all active players
+        let count = 0;
+        for (const [u] of activePlayers) {
+            const q = notifyQueue.get(u) || [];
+            q.push(notif);
+            notifyQueue.set(u, q);
+            count++;
+        }
+        sendWebhook('📢 Broadcast Notification', `Title: **${title}**\nMessage: ${message||''}\nRecipients: ${count}`, 0x5865f2);
+        return res.json({ success: true, recipients: count });
+    }
+    const q = notifyQueue.get(username) || [];
+    q.push(notif);
+    notifyQueue.set(username, q);
+    sendWebhook('🔔 Notification Sent', `To: \`${username}\`\nTitle: **${title}**\nMessage: ${message||''}`, 0x5865f2);
+    res.json({ success: true, username, queued: q.length });
 });
 
 app.get('/api/search', (req, res) => {
