@@ -142,14 +142,29 @@ app.get('/', (req, res) => {
 });
 
 // Owner verification — ID lives server-side only, never exposed to client
-const OWNER_ID = "94C4211189AD542C";
+const OWNER_ID  = "94C4211189AD542C";
+// Admin key — set ADMIN_KEY env var on Render, required for blacklist management
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+
+function requireAdmin(req, res, next) {
+    if (!ADMIN_KEY) {
+        // No key configured — lock down completely
+        return res.status(503).json({ error: 'Admin not configured' });
+    }
+    const provided = req.headers['x-admin-key'] || req.query.key;
+    if (provided !== ADMIN_KEY) {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+
 app.get('/api/verify', (req, res) => {
     const id = req.query.id;
     if (!id) return res.status(400).json({ owner: false });
     res.json({ owner: id === OWNER_ID });
 });
 
-// Blacklist check — mod calls this on startup
+// Blacklist check — public, mod calls this on startup
 app.get('/api/blacklist/check', (req, res) => {
     const username = req.query.username;
     if (!username) return res.status(400).json({ blacklisted: false });
@@ -158,8 +173,9 @@ app.get('/api/blacklist/check', (req, res) => {
     res.json({ blacklisted: false });
 });
 
-// Blacklist a player — GET /api/blacklist?username=NAME&reason=REASON
-app.get('/api/blacklist', (req, res) => {
+// Blacklist a player — requires admin key in x-admin-key header or ?key=
+// Usage: GET /api/blacklist?username=NAME&reason=REASON  (+ header x-admin-key: YOUR_KEY)
+app.get('/api/blacklist', requireAdmin, (req, res) => {
     const { username, reason } = req.query;
     if (!username) return res.status(400).json({ error: 'Username required' });
     blacklist.set(username.toLowerCase(), { reason: reason || 'No reason given', blacklistedAt: new Date().toISOString() });
@@ -167,13 +183,25 @@ app.get('/api/blacklist', (req, res) => {
     res.json({ success: true, username, reason: reason || 'No reason given' });
 });
 
-// Unblacklist a player — GET /api/unblacklist?username=NAME
-app.get('/api/unblacklist', (req, res) => {
+// Unblacklist — requires admin key
+app.get('/api/unblacklist', requireAdmin, (req, res) => {
     const { username } = req.query;
     if (!username) return res.status(400).json({ error: 'Username required' });
     const existed = blacklist.delete(username.toLowerCase());
     console.log(`[BLACKLIST] Removed: ${username} (was blacklisted: ${existed})`);
     res.json({ success: true, username, wasBlacklisted: existed });
+});
+
+// Players list — requires admin key (don't expose IDs publicly)
+app.get('/api/players', requireAdmin, (req, res) => {
+    const list = Object.entries(playerCache).map(([key, data]) => ({
+        playFabId: data.playFabId || key,
+        username:  data.username,
+        firstSeen: data.firstSeen,
+        lastSeen:  data.lastSeen
+    }));
+    list.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+    res.json({ total: list.length, players: list });
 });
 
 app.listen(port, () => {
