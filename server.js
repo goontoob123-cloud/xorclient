@@ -143,18 +143,30 @@ app.get('/', (req, res) => {
 
 // Owner verification — ID lives server-side only, never exposed to client
 const OWNER_ID  = "94C4211189AD542C";
-// Admin key — set ADMIN_KEY env var on Render, required for blacklist management
 const ADMIN_KEY = process.env.ADMIN_KEY || null;
 
+// Rate limiting for blacklist check — prevent brute-force enumeration
+const checkRateMap = new Map(); // ip -> { count, resetAt }
+function rateLimit(req, res, next) {
+    const ip  = req.ip || req.connection.remoteAddress || 'unknown';
+    const now = Date.now();
+    let entry = checkRateMap.get(ip);
+    if (!entry || now > entry.resetAt) {
+        entry = { count: 0, resetAt: now + 60000 }; // reset every minute
+        checkRateMap.set(ip, entry);
+    }
+    entry.count++;
+    if (entry.count > 30) { // max 30 checks per minute per IP
+        return res.status(429).json({ error: 'Too many requests' });
+    }
+    next();
+}
+
+// Admin middleware — key must be in POST body only, never in URL
 function requireAdmin(req, res, next) {
-    if (!ADMIN_KEY) {
-        // No key configured — lock down completely
-        return res.status(503).json({ error: 'Admin not configured' });
-    }
-    const provided = req.headers['x-admin-key'] || req.query.key;
-    if (provided !== ADMIN_KEY) {
-        return res.status(403).json({ error: 'Unauthorized' });
-    }
+    if (!ADMIN_KEY) return res.status(503).json({ error: 'Not configured' });
+    const provided = req.body && req.body.adminKey;
+    if (!provided || provided !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
     next();
 }
 
@@ -164,8 +176,8 @@ app.get('/api/verify', (req, res) => {
     res.json({ owner: id === OWNER_ID });
 });
 
-// Blacklist check — public, mod calls this on startup
-app.get('/api/blacklist/check', (req, res) => {
+// Blacklist check — rate limited, returns minimal info
+app.get('/api/blacklist/check', rateLimit, (req, res) => {
     const username = req.query.username;
     if (!username) return res.status(400).json({ blacklisted: false });
     const entry = blacklist.get(username.toLowerCase());
@@ -173,27 +185,29 @@ app.get('/api/blacklist/check', (req, res) => {
     res.json({ blacklisted: false });
 });
 
-// Blacklist a player — requires admin key in x-admin-key header or ?key=
-// Usage: GET /api/blacklist?username=NAME&reason=REASON  (+ header x-admin-key: YOUR_KEY)
-app.get('/api/blacklist', requireAdmin, (req, res) => {
-    const { username, reason } = req.query;
+// ── Admin-only routes — POST body required, key never in URL ──────────
+// Blacklist:   POST /api/admin/bl  { adminKey, username, reason }
+// Unblacklist: POST /api/admin/ubl { adminKey, username }
+// Players:     POST /api/admin/players { adminKey }
+// These route names are intentionally short and non-descriptive
+
+app.post('/api/admin/bl', requireAdmin, (req, res) => {
+    const { username, reason } = req.body;
     if (!username) return res.status(400).json({ error: 'Username required' });
     blacklist.set(username.toLowerCase(), { reason: reason || 'No reason given', blacklistedAt: new Date().toISOString() });
-    console.log(`[BLACKLIST] Added: ${username} — Reason: ${reason || 'No reason given'}`);
-    res.json({ success: true, username, reason: reason || 'No reason given' });
+    console.log(`[BL] +${username} — ${reason || 'no reason'}`);
+    res.json({ success: true });
 });
 
-// Unblacklist — requires admin key
-app.get('/api/unblacklist', requireAdmin, (req, res) => {
-    const { username } = req.query;
+app.post('/api/admin/ubl', requireAdmin, (req, res) => {
+    const { username } = req.body;
     if (!username) return res.status(400).json({ error: 'Username required' });
     const existed = blacklist.delete(username.toLowerCase());
-    console.log(`[BLACKLIST] Removed: ${username} (was blacklisted: ${existed})`);
-    res.json({ success: true, username, wasBlacklisted: existed });
+    console.log(`[BL] -${username} (existed: ${existed})`);
+    res.json({ success: true, wasBlacklisted: existed });
 });
 
-// Players list — requires admin key (don't expose IDs publicly)
-app.get('/api/players', requireAdmin, (req, res) => {
+app.post('/api/admin/players', requireAdmin, (req, res) => {
     const list = Object.entries(playerCache).map(([key, data]) => ({
         playFabId: data.playFabId || key,
         username:  data.username,
@@ -204,17 +218,14 @@ app.get('/api/players', requireAdmin, (req, res) => {
     res.json({ total: list.length, players: list });
 });
 
+// Block the old public GET routes so they return 404 instead of leaking info
+app.get('/api/blacklist',   (_, res) => res.status(404).end());
+app.get('/api/unblacklist', (_, res) => res.status(404).end());
+app.get('/api/players',     (_, res) => res.status(404).end());
+
 app.listen(port, () => {
     console.log(`API server running on port ${port}`);
-    console.log(`Tracked players will appear in console logs`);
-    console.log(`API endpoints:`);
-    console.log(`  POST /api/heartbeat - Player heartbeat`);
-    console.log(`  GET  /api/search?username= - Search players`);
-    console.log(`  GET  /api/onlinecount - Get online count`);
-    console.log(`  GET  /api/status - Get all players (JSON only)`);
-    console.log(`  GET  /api/verify?id= - Owner verification`);
-    console.log(`  GET  /api/blacklist/check?username= - Check if blacklisted`);
-    console.log(`  GET  /api/blacklist?username=&reason= - Blacklist player`);
-    console.log(`  GET  /api/unblacklist?username= - Unblacklist player`);
-    console.log(`  GET  /api/players - List all cached players + IDs`);
+    console.log(`ADMIN_KEY configured: ${!!ADMIN_KEY}`);
+    console.log(`Public endpoints: /api/heartbeat, /api/search, /api/onlinecount, /api/status, /api/verify, /api/blacklist/check`);
+    console.log(`Admin endpoints (POST + adminKey in body): /api/admin/bl, /api/admin/ubl, /api/admin/players`);
 });
