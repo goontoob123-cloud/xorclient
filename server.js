@@ -1,157 +1,227 @@
 const express = require('express');
-const path = require('path');
-const cors = require('cors');
-const https = require('https');
+const path    = require('path');
+const cors    = require('cors');
+const https   = require('https');
+const crypto  = require('crypto');
 
-const app = express();
+const app  = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// In-memory player cache — persists until server restarts
-// playFabId (or 'user:username') -> { username, playFabId, firstSeen, lastSeen }
-const playerCache = {};
+// ── Config ────────────────────────────────────────────────────────────
+const OWNER_ID    = "94C4211189AD542C";
+const ADMIN_KEY   = process.env.ADMIN_KEY   || "xorvlynadmin2024";
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || "";
 
-// Store active players
-const activePlayers = new Map(); // username -> { roomCode, lastSeen, playerCount, maxPlayers, playFabId }
+// ── Stores ────────────────────────────────────────────────────────────
+const activePlayers = new Map();
+const playerCache   = {};
+const blacklist     = new Map();
+// key -> { owner, hwid, tier, createdAt, expiresAt, lastUsed, useCount, banned, banReason, lastUsername }
+const keyStore      = new Map();
+// sessionToken -> { key, hwid, username, createdAt, expiresAt, tier }
+const sessions      = new Map();
+const authRateMap   = new Map();
+const checkRateMap  = new Map();
 
-// Blacklist — username -> { reason, blacklistedAt }
-const blacklist = new Map();
-
-// Cleanup inactive players every minute
-setInterval(() => {
-    const now = Date.now();
-    for (const [username, data] of activePlayers.entries()) {
-        if (now - data.lastSeen > 60000) { // 60 seconds timeout
-            activePlayers.delete(username);
-        }
-    }
-}, 60000);
-
-// Heartbeat endpoint - players send their status every 30 seconds
-app.post('/api/heartbeat', (req, res) => {
-    const { username, roomCode, playerCount, maxPlayers, timestamp, playFabId } = req.body;
-    
-    if (!username) {
-        return res.status(400).json({ error: 'Username required' });
-    }
-    
-    activePlayers.set(username, {
-        roomCode: roomCode || 'Not in room',
-        playerCount: playerCount || 0,
-        maxPlayers: maxPlayers || 0,
-        lastSeen: Date.now(),
-        lastSeenTime: timestamp,
-        playFabId: playFabId || ''
+// ── Discord webhook ───────────────────────────────────────────────────
+function sendWebhook(title, description, color) {
+    if (!WEBHOOK_URL) return;
+    const body = JSON.stringify({
+        embeds: [{ title, description, color: color || 0x2b2d31, timestamp: new Date().toISOString(), footer: { text: 'Xor Client' } }]
     });
+    try {
+        const u = new URL(WEBHOOK_URL);
+        const r = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } });
+        r.on('error', () => {});
+        r.write(body); r.end();
+    } catch {}
+}
 
-    // Cache player — always save by username, use playFabId as key if available
-    const cacheKey = playFabId || ('user:' + username);
-    const existing = playerCache[cacheKey];
-    const now = new Date().toISOString();
-    if (!existing) {
-        playerCache[cacheKey] = { username, playFabId: playFabId || '', firstSeen: now, lastSeen: now };
-    } else {
-        existing.username  = username;
-        existing.playFabId = playFabId || '';
-        existing.lastSeen  = now;
-        if (playFabId && cacheKey.startsWith('user:')) {
-            playerCache[playFabId] = existing;
-            delete playerCache[cacheKey];
-        }
+// ── Helpers ───────────────────────────────────────────────────────────
+function genKey() {
+    const s = () => crypto.randomBytes(2).toString('hex').toUpperCase();
+    return `XORV-${s()}-${s()}-${s()}-${s()}`;
+}
+function genToken()      { return crypto.randomBytes(32).toString('hex'); }
+function hashHwid(hwid)  { return crypto.createHash('sha256').update(hwid + 'xorvsalt2024').digest('hex'); }
+function isExpired(e)    { return e.expiresAt && Date.now() > new Date(e.expiresAt).getTime(); }
+
+function requireAdmin(req, res, next) {
+    const k = (req.body && req.body.adminKey) || req.query.key;
+    if (!k || k !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
+    next();
+}
+function authRate(req, res, next) {
+    const ip = req.ip || 'x'; const now = Date.now();
+    let e = authRateMap.get(ip);
+    if (!e || now > e.r) { e = { c: 0, r: now + 60000 }; authRateMap.set(ip, e); }
+    if (++e.c > 10) return res.status(429).json({ error: 'Too many attempts. Wait 1 minute.' });
+    next();
+}
+function checkRate(req, res, next) {
+    const ip = req.ip || 'x'; const now = Date.now();
+    let e = checkRateMap.get(ip);
+    if (!e || now > e.r) { e = { c: 0, r: now + 60000 }; checkRateMap.set(ip, e); }
+    if (++e.c > 60) return res.status(429).json({ error: 'Rate limited' });
+    next();
+}
+
+// Cleanup
+setInterval(() => { const n = Date.now(); for (const [t, s] of sessions) if (n > new Date(s.expiresAt).getTime()) sessions.delete(t); }, 600000);
+setInterval(() => { const n = Date.now(); for (const [u, d] of activePlayers) if (n - d.lastSeen > 60000) activePlayers.delete(u); }, 60000);
+
+// =====================================================================
+//  KEY AUTH
+// =====================================================================
+
+// POST /api/auth/validate  { key, hwid, username }
+// Returns session token on success
+app.post('/api/auth/validate', authRate, (req, res) => {
+    const { key, hwid, username } = req.body;
+    if (!key || !hwid) return res.status(400).json({ success: false, error: 'Key and HWID required' });
+
+    const entry = keyStore.get(key);
+    if (!entry) {
+        sendWebhook('❌ Invalid Key', `Key: \`${key}\`\nUser: \`${username||'?'}\``, 0xed4245);
+        return res.status(401).json({ success: false, error: 'Invalid key' });
     }
-    
-    console.log(`[HEARTBEAT] ${username} (${playFabId || 'no id'}) - Room: ${roomCode || 'None'} - Players: ${playerCount || 0}/${maxPlayers || 0}`);
-    
-    res.json({ 
-        success: true, 
-        onlineCount: activePlayers.size,
-        timestamp: new Date().toISOString()
-    });
+    if (entry.banned) {
+        sendWebhook('🚫 Banned Key Used', `Key: \`${key}\`\nUser: \`${username||'?'}\`\nReason: ${entry.banReason}`, 0xed4245);
+        return res.status(403).json({ success: false, error: 'Key banned: ' + (entry.banReason || 'contact support') });
+    }
+    if (isExpired(entry)) return res.status(403).json({ success: false, error: 'Key expired' });
+
+    const hashed = hashHwid(hwid);
+    if (!entry.hwid) {
+        entry.hwid = hashed;
+        sendWebhook('🔑 Key Activated', `Key: \`${key}\`\nUser: \`${username||'?'}\`\nTier: \`${entry.tier}\``, 0x57f287);
+    } else if (entry.hwid !== hashed) {
+        sendWebhook('⚠️ HWID Mismatch', `Key: \`${key}\`\nUser: \`${username||'?'}\``, 0xfee75c);
+        return res.status(403).json({ success: false, error: 'Key is bound to a different machine. Contact support to reset.' });
+    }
+
+    entry.lastUsed = new Date().toISOString();
+    entry.useCount = (entry.useCount || 0) + 1;
+    if (username) entry.lastUsername = username;
+
+    const token   = genToken();
+    const expires = new Date(Date.now() + 86400000).toISOString(); // 24h
+    sessions.set(token, { key, hwid: hashed, username: username||'', createdAt: new Date().toISOString(), expiresAt: expires, tier: entry.tier });
+
+    res.json({ success: true, token, tier: entry.tier, expiresAt: expires });
 });
 
-// Search endpoint
+// POST /api/auth/check  { token, hwid }
+// Verify session is still valid (called on heartbeat)
+app.post('/api/auth/check', checkRate, (req, res) => {
+    const { token, hwid } = req.body;
+    if (!token || !hwid) return res.status(400).json({ valid: false });
+    const s = sessions.get(token);
+    if (!s) return res.json({ valid: false, error: 'Session not found' });
+    if (Date.now() > new Date(s.expiresAt).getTime()) { sessions.delete(token); return res.json({ valid: false, error: 'Session expired' }); }
+    if (s.hwid !== hashHwid(hwid)) return res.json({ valid: false, error: 'HWID mismatch' });
+    const entry = keyStore.get(s.key);
+    if (!entry || entry.banned) return res.json({ valid: false, error: 'Key revoked' });
+    res.json({ valid: true, tier: s.tier });
+});
+
+// GET /api/auth/status?token=TOKEN
+app.get('/api/auth/status', checkRate, (req, res) => {
+    const s = sessions.get(req.query.token);
+    if (!s || Date.now() > new Date(s.expiresAt).getTime()) return res.json({ valid: false });
+    res.json({ valid: true, tier: s.tier, expiresAt: s.expiresAt });
+});
+
+// =====================================================================
+//  ADMIN — KEY MANAGEMENT
+// =====================================================================
+
+// GET /api/admin/genkey?key=ADMIN&tier=user&days=30&owner=NAME
+app.get('/api/admin/genkey', requireAdmin, (req, res) => {
+    const { tier, days, owner } = req.query;
+    const newKey    = genKey();
+    const expiresAt = days ? new Date(Date.now() + parseInt(days) * 86400000).toISOString() : null;
+    keyStore.set(newKey, { owner: owner||'unknown', hwid: null, tier: tier||'user', createdAt: new Date().toISOString(), expiresAt, lastUsed: null, useCount: 0, banned: false, banReason: null, lastUsername: null });
+    sendWebhook('🔑 Key Generated', `Key: \`${newKey}\`\nOwner: \`${owner||'unknown'}\`\nTier: \`${tier||'user'}\`\nExpires: \`${expiresAt||'never'}\``, 0x57f287);
+    res.json({ success: true, key: newKey, tier: tier||'user', expiresAt });
+});
+
+// GET /api/admin/revokekey?key=ADMIN&target=KEY&reason=REASON
+app.get('/api/admin/revokekey', requireAdmin, (req, res) => {
+    const { target, reason } = req.query;
+    if (!target) return res.status(400).json({ error: 'Target required' });
+    const entry = keyStore.get(target);
+    if (!entry) return res.status(404).json({ error: 'Key not found' });
+    entry.banned = true; entry.banReason = reason || 'Revoked by admin';
+    for (const [t, s] of sessions) if (s.key === target) sessions.delete(t);
+    sendWebhook('🔨 Key Revoked', `Key: \`${target}\`\nOwner: \`${entry.owner}\`\nReason: ${reason||'none'}`, 0xed4245);
+    res.json({ success: true });
+});
+
+// GET /api/admin/resetkey?key=ADMIN&target=KEY  — reset HWID binding
+app.get('/api/admin/resetkey', requireAdmin, (req, res) => {
+    const { target } = req.query;
+    if (!target) return res.status(400).json({ error: 'Target required' });
+    const entry = keyStore.get(target);
+    if (!entry) return res.status(404).json({ error: 'Key not found' });
+    entry.hwid = null;
+    sendWebhook('🔄 HWID Reset', `Key: \`${target}\`\nOwner: \`${entry.owner}\``, 0x5865f2);
+    res.json({ success: true });
+});
+
+// GET /api/admin/unbankey?key=ADMIN&target=KEY
+app.get('/api/admin/unbankey', requireAdmin, (req, res) => {
+    const { target } = req.query;
+    if (!target) return res.status(400).json({ error: 'Target required' });
+    const entry = keyStore.get(target);
+    if (!entry) return res.status(404).json({ error: 'Key not found' });
+    entry.banned = false; entry.banReason = null;
+    sendWebhook('✅ Key Unbanned', `Key: \`${target}\`\nOwner: \`${entry.owner}\``, 0x57f287);
+    res.json({ success: true });
+});
+
+// GET /api/admin/keys?key=ADMIN  — list all keys
+app.get('/api/admin/keys', requireAdmin, (req, res) => {
+    const list = [];
+    for (const [k, v] of keyStore)
+        list.push({ key: k, owner: v.owner, tier: v.tier, hwid: v.hwid ? v.hwid.substring(0,8)+'...' : null, createdAt: v.createdAt, expiresAt: v.expiresAt, lastUsed: v.lastUsed, useCount: v.useCount, banned: v.banned, lastUsername: v.lastUsername });
+    res.json({ total: list.length, keys: list });
+});
+
+// =====================================================================
+//  EXISTING ENDPOINTS
+// =====================================================================
+
+app.post('/api/heartbeat', (req, res) => {
+    const { username, roomCode, playerCount, maxPlayers, timestamp, playFabId } = req.body;
+    if (!username) return res.status(400).json({ error: 'Username required' });
+    activePlayers.set(username, { roomCode: roomCode||'Not in room', playerCount: playerCount||0, maxPlayers: maxPlayers||0, lastSeen: Date.now(), lastSeenTime: timestamp, playFabId: playFabId||'' });
+    const ck = playFabId || ('user:' + username);
+    const ex = playerCache[ck]; const now = new Date().toISOString();
+    if (!ex) { playerCache[ck] = { username, playFabId: playFabId||'', firstSeen: now, lastSeen: now }; }
+    else { ex.username = username; ex.playFabId = playFabId||''; ex.lastSeen = now; if (playFabId && ck.startsWith('user:')) { playerCache[playFabId] = ex; delete playerCache[ck]; } }
+    res.json({ success: true, onlineCount: activePlayers.size, timestamp: new Date().toISOString() });
+});
+
 app.get('/api/search', (req, res) => {
-    const searchUsername = req.query.username;
-    
-    if (!searchUsername) {
-        return res.status(400).json({ error: 'Username parameter required' });
-    }
-    
+    const q = req.query.username;
+    if (!q) return res.status(400).json({ error: 'Username required' });
     const results = [];
-    
-    // Search for matching usernames (case-insensitive partial match)
-    for (const [username, data] of activePlayers.entries()) {
-        if (username.toLowerCase().includes(searchUsername.toLowerCase())) {
-            results.push({
-                username: username,
-                roomCode: data.roomCode,
-                lastSeen: data.lastSeenTime
-            });
-        }
-    }
-    
-    console.log(`[SEARCH] Query: "${searchUsername}" - Found ${results.length} results`);
-    
+    for (const [u, d] of activePlayers) if (u.toLowerCase().includes(q.toLowerCase())) results.push({ username: u, roomCode: d.roomCode, lastSeen: d.lastSeenTime });
     res.json(results);
 });
 
-// Get online count endpoint (for the mod to display)
-app.get('/api/onlinecount', (req, res) => {
-    res.json({ onlineCount: activePlayers.size });
-});
+app.get('/api/onlinecount', (req, res) => res.json({ onlineCount: activePlayers.size }));
 
-// Simple status endpoint (no HTML, just JSON) — no PlayFab IDs exposed publicly
 app.get('/api/status', (req, res) => {
     const players = [];
-    for (const [username, data] of activePlayers.entries()) {
-        players.push({
-            username:    username,
-            roomCode:    data.roomCode,
-            playerCount: data.playerCount,
-            maxPlayers:  data.maxPlayers
-        });
-    }
+    for (const [u, d] of activePlayers) players.push({ username: u, roomCode: d.roomCode, playerCount: d.playerCount, maxPlayers: d.maxPlayers });
     res.json({ onlineCount: activePlayers.size, players, timestamp: new Date().toISOString() });
 });
-
-// /api/players is admin-only — see POST /api/admin/players
-
-// Serve the main page
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Owner verification — ID lives server-side only, never exposed to client
-const OWNER_ID  = "94C4211189AD542C";
-const ADMIN_KEY = process.env.ADMIN_KEY || "xorvlynadmin2024";
-
-// Rate limiting for blacklist check — prevent brute-force enumeration
-const checkRateMap = new Map(); // ip -> { count, resetAt }
-function rateLimit(req, res, next) {
-    const ip  = req.ip || req.connection.remoteAddress || 'unknown';
-    const now = Date.now();
-    let entry = checkRateMap.get(ip);
-    if (!entry || now > entry.resetAt) {
-        entry = { count: 0, resetAt: now + 60000 }; // reset every minute
-        checkRateMap.set(ip, entry);
-    }
-    entry.count++;
-    if (entry.count > 30) { // max 30 checks per minute per IP
-        return res.status(429).json({ error: 'Too many requests' });
-    }
-    next();
-}
-
-// Admin middleware — accepts key in body (POST) OR as ?key= query param (GET, browser-friendly)
-function requireAdmin(req, res, next) {
-    if (!ADMIN_KEY) return res.status(503).json({ error: 'Not configured' });
-    const provided = (req.body && req.body.adminKey) || req.query.key;
-    if (!provided || provided !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
-    next();
-}
 
 app.get('/api/verify', (req, res) => {
     const id = req.query.id;
@@ -159,56 +229,33 @@ app.get('/api/verify', (req, res) => {
     res.json({ owner: id === OWNER_ID });
 });
 
-// Blacklist check — rate limited, returns minimal info
-app.get('/api/blacklist/check', rateLimit, (req, res) => {
-    const username = req.query.username;
-    if (!username) return res.status(400).json({ blacklisted: false });
-    const entry = blacklist.get(username.toLowerCase());
-    if (entry) return res.json({ blacklisted: true, reason: entry.reason });
-    res.json({ blacklisted: false });
+app.get('/api/blacklist/check', checkRate, (req, res) => {
+    const u = req.query.username;
+    if (!u) return res.status(400).json({ blacklisted: false });
+    const e = blacklist.get(u.toLowerCase());
+    res.json(e ? { blacklisted: true, reason: e.reason } : { blacklisted: false });
 });
 
-// ── Admin-only routes — POST body required, key never in URL ──────────
-// Blacklist:   POST /api/admin/bl  { adminKey, username, reason }
-// Unblacklist: POST /api/admin/ubl { adminKey, username }
-// Players:     POST /api/admin/players { adminKey }
-// These route names are intentionally short and non-descriptive
+app.get('/api/admin/bl',  requireAdmin, (req, res) => { const { username, reason } = req.query; if (!username) return res.status(400).json({ error: 'Username required' }); blacklist.set(username.toLowerCase(), { reason: reason||'No reason', blacklistedAt: new Date().toISOString() }); sendWebhook('🚫 Blacklisted', `User: \`${username}\`\nReason: ${reason||'none'}`, 0xed4245); res.json({ success: true }); });
+app.get('/api/admin/ubl', requireAdmin, (req, res) => { const { username } = req.query; if (!username) return res.status(400).json({ error: 'Username required' }); blacklist.delete(username.toLowerCase()); sendWebhook('✅ Unblacklisted', `User: \`${username}\``, 0x57f287); res.json({ success: true }); });
 
-app.post('/api/admin/bl', requireAdmin, (req, res) => {
-    const { username, reason } = req.body;
-    if (!username) return res.status(400).json({ error: 'Username required' });
-    blacklist.set(username.toLowerCase(), { reason: reason || 'No reason given', blacklistedAt: new Date().toISOString() });
-    console.log(`[BL] +${username} — ${reason || 'no reason'}`);
-    res.json({ success: true });
-});
-
-app.post('/api/admin/ubl', requireAdmin, (req, res) => {
-    const { username } = req.body;
-    if (!username) return res.status(400).json({ error: 'Username required' });
-    const existed = blacklist.delete(username.toLowerCase());
-    console.log(`[BL] -${username} (existed: ${existed})`);
-    res.json({ success: true, wasBlacklisted: existed });
-});
-
-app.post('/api/admin/players', requireAdmin, (req, res) => {
-    const list = Object.entries(playerCache).map(([key, data]) => ({
-        playFabId: data.playFabId || key,
-        username:  data.username,
-        firstSeen: data.firstSeen,
-        lastSeen:  data.lastSeen
-    }));
+app.get('/api/admin/players', requireAdmin, (req, res) => {
+    const list = Object.entries(playerCache).map(([k, d]) => ({ playFabId: d.playFabId||k, username: d.username, firstSeen: d.firstSeen, lastSeen: d.lastSeen }));
     list.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
     res.json({ total: list.length, players: list });
 });
 
-// Block the old public GET routes so they return 404 instead of leaking info
 app.get('/api/blacklist',   (_, res) => res.status(404).end());
 app.get('/api/unblacklist', (_, res) => res.status(404).end());
 app.get('/api/players',     (_, res) => res.status(404).end());
 
+app.get('/', (req, res) => {
+    try { res.sendFile(path.join(__dirname, 'public', 'index.html')); } catch { res.json({ status: 'Xor Client API' }); }
+});
+
 app.listen(port, () => {
-    console.log(`API server running on port ${port}`);
-    console.log(`ADMIN_KEY configured: ${!!ADMIN_KEY}`);
-    console.log(`Public endpoints: /api/heartbeat, /api/search, /api/onlinecount, /api/status, /api/verify, /api/blacklist/check`);
-    console.log(`Admin endpoints (POST + adminKey in body): /api/admin/bl, /api/admin/ubl, /api/admin/players`);
+    console.log(`Xor Client API on port ${port}`);
+    console.log(`Webhook: ${WEBHOOK_URL ? 'set' : 'not set'}`);
+    console.log(`Auth endpoints: POST /api/auth/validate | POST /api/auth/check | GET /api/auth/status`);
+    console.log(`Key mgmt: GET /api/admin/genkey | revokekey | resetkey | unbankey | keys`);
 });
