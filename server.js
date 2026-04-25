@@ -216,8 +216,9 @@ app.post('/api/heartbeat', (req, res) => {
 // Push a real-time notification to a specific player (delivered on next heartbeat)
 // Use username=* to broadcast to everyone currently online
 app.get('/api/admin/notify', requireAdmin, (req, res) => {
-    const { username, title, message } = req.query;
-    if (!username || !title) return res.status(400).json({ error: 'username and title required' });
+    const { title, message } = req.query;
+    const username = req.query.username || '*';
+    if (!title) return res.status(400).json({ error: 'title required' });
     const notif = { title, message: message || '' };
     if (username === '*') {
         // Broadcast to all active players
@@ -309,7 +310,7 @@ GET  /api/admin/keys          ?key=
 GET  /api/admin/players       ?key=
 GET  /api/admin/bl            ?key= &username=NAME &reason=REASON
 GET  /api/admin/ubl           ?key= &username=NAME
-GET  /api/admin/notify        ?key= &username=NAME|* &title=TITLE &message=MSG
+GET  /api/admin/notify        ?key= &title=TITLE &message=MSG [&username=NAME|*]
 `);
 });
 
