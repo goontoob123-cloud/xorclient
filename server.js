@@ -279,6 +279,39 @@ app.get('/api/blacklist',   (_, res) => res.status(404).end());
 app.get('/api/unblacklist', (_, res) => res.status(404).end());
 app.get('/api/players',     (_, res) => res.status(404).end());
 
+// GET /api
+app.get('/api', (req, res) => {
+    res.type('text/plain').send(`Xor Client API
+Admin routes require ?key=ADMIN_KEY
+
+--- AUTH ---
+POST /api/auth/validate       body: { key, hwid, username }
+POST /api/auth/check          body: { token, hwid }
+GET  /api/auth/status         ?token=TOKEN
+
+--- PUBLIC ---
+POST /api/heartbeat           body: { username, roomCode, playerCount, maxPlayers, timestamp, playFabId }
+GET  /api/search              ?username=QUERY
+GET  /api/onlinecount
+GET  /api/status
+GET  /api/verify              ?id=PLAYFAB_ID
+GET  /api/blacklist/check     ?username=NAME
+
+--- ADMIN: KEYS ---
+GET  /api/admin/genkey        ?key= &tier=user &days=30 &owner=NAME
+GET  /api/admin/revokekey     ?key= &target=KEY &reason=REASON
+GET  /api/admin/resetkey      ?key= &target=KEY
+GET  /api/admin/unbankey      ?key= &target=KEY
+GET  /api/admin/keys          ?key=
+
+--- ADMIN: PLAYERS & MODERATION ---
+GET  /api/admin/players       ?key=
+GET  /api/admin/bl            ?key= &username=NAME &reason=REASON
+GET  /api/admin/ubl           ?key= &username=NAME
+GET  /api/admin/notify        ?key= &username=NAME|* &title=TITLE &message=MSG
+`);
+});
+
 app.get('/', (req, res) => {
     try { res.sendFile(path.join(__dirname, 'public', 'index.html')); } catch { res.json({ status: 'Xor Client API' }); }
 });
