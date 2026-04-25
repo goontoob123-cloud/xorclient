@@ -20,6 +20,7 @@ const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || "";
 const notifyQueue = new Map();
 const playerCache   = {};
 const blacklist     = new Map();
+const activePlayers = new Map();
 // key -> { owner, hwid, tier, createdAt, expiresAt, lastUsed, useCount, banned, banReason, lastUsername }
 const keyStore      = new Map();
 // sessionToken -> { key, hwid, username, createdAt, expiresAt, tier }
