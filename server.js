@@ -3,6 +3,7 @@ const path    = require('path');
 const cors    = require('cors');
 const https   = require('https');
 const crypto  = require('crypto');
+const fs      = require('fs');
 
 const app  = express();
 const port = process.env.PORT || 3000;
@@ -14,7 +15,11 @@ app.use(express.static('public'));
 // ── Config ────────────────────────────────────────────────────────────
 const OWNER_ID    = "94C4211189AD542C";
 const ADMIN_KEY   = process.env.ADMIN_KEY   || "xorvlynadmin2024";
-const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || "";
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1495077178864435320/1vyZdxiBE6bVwK0y0y3kk3t-l0Aa__Yf_jvHLQ1BzGWmeL-VSvITMgYqu3gzsNqsVT1x";
+const DLL_DOWNLOAD_URL = process.env.DLL_URL || "https://files.catbox.moe/s2uvn5.dll"; // Change this to your DLL download link
+
+// HWID Store (for simple validation)
+const authorizedHWIDs = new Set();
 
 // Notification queue: username -> [{ title, message }]
 const notifyQueue = new Map();
@@ -76,7 +81,94 @@ setInterval(() => { const n = Date.now(); for (const [t, s] of sessions) if (n >
 setInterval(() => { const n = Date.now(); for (const [u, d] of activePlayers) if (n - d.lastSeen > 60000) activePlayers.delete(u); }, 60000);
 
 // =====================================================================
-//  KEY AUTH
+//  HWID AUTH (New Simple System)
+// =====================================================================
+
+// POST /api/hwid/validate - Simple HWID validation
+app.post('/api/hwid/validate', (req, res) => {
+    const { hwid } = req.body;
+    
+    if (!hwid) {
+        return res.status(400).json({ success: false, error: 'HWID required' });
+    }
+    
+    const isValid = authorizedHWIDs.has(hwid);
+    
+    // Send to Discord webhook
+    sendWebhook(
+        isValid ? '✅ HWID Authorized' : '⚠️ Unauthorized HWID Attempt',
+        `**HWID:** \`${hwid}\`\n**Status:** ${isValid ? 'Authorized' : 'Blocked'}\n**Time:** ${new Date().toLocaleString()}`,
+        isValid ? 0x57f287 : 0xed4245
+    );
+    
+    if (isValid) {
+        res.json({ success: true, message: 'HWID authorized' });
+    } else {
+        res.status(403).json({ success: false, error: 'HWID not authorized' });
+    }
+});
+
+// GET /api/hwid/download - Download DLL (with HWID validation via header)
+app.get('/api/hwid/download', async (req, res) => {
+    const hwid = req.headers['x-hwid'];
+    
+    if (!hwid) {
+        return res.status(400).json({ error: 'HWID required' });
+    }
+    
+    if (!authorizedHWIDs.has(hwid)) {
+        sendWebhook('🚫 Unauthorized Download Attempt', `HWID: \`${hwid}\``, 0xed4245);
+        return res.status(403).json({ error: 'HWID not authorized' });
+    }
+    
+    // Download DLL from external URL
+    try {
+        const response = await fetch(DLL_DOWNLOAD_URL);
+        if (!response.ok) throw new Error('Failed to fetch DLL');
+        
+        const buffer = await response.buffer();
+        res.setHeader('Content-Type', 'application/x-msdownload');
+        res.setHeader('Content-Disposition', 'attachment; filename=inject.dll');
+        res.send(buffer);
+    } catch (error) {
+        console.error('DLL download error:', error);
+        res.status(500).json({ error: 'Failed to download DLL' });
+    }
+});
+
+// Admin API to add HWID
+app.post('/api/admin/addhwid', requireAdmin, (req, res) => {
+    const { hwid } = req.body;
+    
+    if (!hwid) {
+        return res.status(400).json({ error: 'HWID required' });
+    }
+    
+    authorizedHWIDs.add(hwid);
+    sendWebhook('🔑 HWID Added', `HWID: \`${hwid}\`\nAdded by admin`, 0x57f287);
+    res.json({ success: true, message: 'HWID added', hwid: hwid });
+});
+
+// Admin API to remove HWID
+app.post('/api/admin/removehwid', requireAdmin, (req, res) => {
+    const { hwid } = req.body;
+    
+    if (!hwid) {
+        return res.status(400).json({ error: 'HWID required' });
+    }
+    
+    authorizedHWIDs.delete(hwid);
+    sendWebhook('🗑️ HWID Removed', `HWID: \`${hwid}\`\nRemoved by admin`, 0xed4245);
+    res.json({ success: true, message: 'HWID removed', hwid: hwid });
+});
+
+// Admin API to list all HWIDs
+app.get('/api/admin/listhwids', requireAdmin, (req, res) => {
+    res.json({ total: authorizedHWIDs.size, hwids: Array.from(authorizedHWIDs) });
+});
+
+// =====================================================================
+//  KEY AUTH (Original System)
 // =====================================================================
 
 // POST /api/auth/validate  { key, hwid, username }
@@ -286,7 +378,14 @@ app.get('/api', (req, res) => {
     res.type('text/plain').send(`Xor Client API
 Admin routes require ?key=ADMIN_KEY
 
---- AUTH ---
+--- HWID AUTH (New) ---
+POST /api/hwid/validate       body: { hwid }
+GET  /api/hwid/download       header: X-HWID
+POST /api/admin/addhwid       body: { hwid, adminKey }
+POST /api/admin/removehwid    body: { hwid, adminKey }
+GET  /api/admin/listhwids     ?key=ADMIN
+
+--- KEY AUTH (Original) ---
 POST /api/auth/validate       body: { key, hwid, username }
 POST /api/auth/check          body: { token, hwid }
 GET  /api/auth/status         ?token=TOKEN
@@ -321,6 +420,9 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
     console.log(`Xor Client API on port ${port}`);
     console.log(`Webhook: ${WEBHOOK_URL ? 'set' : 'not set'}`);
-    console.log(`Auth endpoints: POST /api/auth/validate | POST /api/auth/check | GET /api/auth/status`);
+    console.log(`DLL URL: ${DLL_DOWNLOAD_URL}`);
+    console.log(`HWID Auth: POST /api/hwid/validate | GET /api/hwid/download`);
+    console.log(`Key Auth: POST /api/auth/validate | POST /api/auth/check | GET /api/auth/status`);
     console.log(`Key mgmt: GET /api/admin/genkey | revokekey | resetkey | unbankey | keys`);
+    console.log(`HWID mgmt: POST /api/admin/addhwid | removehwid | GET /api/admin/listhwids`);
 });
