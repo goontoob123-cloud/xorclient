@@ -16,7 +16,7 @@ app.use(express.static('public'));
 const OWNER_ID    = "94C4211189AD542C";
 const ADMIN_KEY   = process.env.ADMIN_KEY   || "xorvlynadmin2024";
 const WEBHOOK_URL = process.env.DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1495077178864435320/1vyZdxiBE6bVwK0y0y3kk3t-l0Aa__Yf_jvHLQ1BzGWmeL-VSvITMgYqu3gzsNqsVT1x";
-const DLL_DOWNLOAD_URL = process.env.DLL_URL || "https://files.catbox.moe/s2uvn5.dll"; // Change this to your DLL download link
+const DLL_DOWNLOAD_URL = process.env.DLL_URL || "https://files.catbox.moe/s2uvn5.dll";
 
 // HWID Store (for simple validation)
 const authorizedHWIDs = new Set();
@@ -106,6 +106,29 @@ app.post('/api/hwid/validate', (req, res) => {
     } else {
         res.status(403).json({ success: false, error: 'HWID not authorized' });
     }
+});
+
+// GET /api/hwid/verify - Browser-friendly HWID verification (NEW)
+app.get('/api/hwid/verify', (req, res) => {
+    const hwid = req.query.hwid;
+    
+    if (!hwid) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'HWID required. Use: /api/hwid/verify?hwid=YOUR_HWID' 
+        });
+    }
+    
+    const isValid = authorizedHWIDs.has(hwid);
+    
+    res.json({ 
+        success: true,
+        hwid: hwid,
+        authorized: isValid,
+        status: isValid ? '✅ Authorized' : '❌ Not Authorized',
+        message: isValid ? 'HWID is authorized' : 'HWID is not authorized',
+        timestamp: new Date().toISOString()
+    });
 });
 
 // GET /api/hwid/download - Download DLL (with HWID validation via header)
@@ -380,6 +403,7 @@ Admin routes require ?key=ADMIN_KEY
 
 --- HWID AUTH (New) ---
 POST /api/hwid/validate       body: { hwid }
+GET  /api/hwid/verify         ?hwid=YOUR_HWID (Browser-friendly)
 GET  /api/hwid/download       header: X-HWID
 POST /api/admin/addhwid       body: { hwid, adminKey }
 POST /api/admin/removehwid    body: { hwid, adminKey }
@@ -421,7 +445,7 @@ app.listen(port, () => {
     console.log(`Xor Client API on port ${port}`);
     console.log(`Webhook: ${WEBHOOK_URL ? 'set' : 'not set'}`);
     console.log(`DLL URL: ${DLL_DOWNLOAD_URL}`);
-    console.log(`HWID Auth: POST /api/hwid/validate | GET /api/hwid/download`);
+    console.log(`HWID Auth: POST /api/hwid/validate | GET /api/hwid/verify | GET /api/hwid/download`);
     console.log(`Key Auth: POST /api/auth/validate | POST /api/auth/check | GET /api/auth/status`);
     console.log(`Key mgmt: GET /api/admin/genkey | revokekey | resetkey | unbankey | keys`);
     console.log(`HWID mgmt: POST /api/admin/addhwid | removehwid | GET /api/admin/listhwids`);
